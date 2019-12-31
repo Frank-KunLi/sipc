@@ -1,3 +1,10 @@
+/*
+sipc todo
+    - integrate msglog
+    - integrate nng
+    - more challenging test programs
+*/
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -7,6 +14,7 @@
 #include <errno.h>
 
 #include "pthread.h"
+#include <glib.h>
 
 #include <nanomsg/nn.h>
 #include <nanomsg/pubsub.h>
@@ -17,6 +25,12 @@
 #define SIZEOF(x)   (sizeof((x))/sizeof((x)[0]))
 
 #define FREE_MEM(x) if((x)) { free((void *)(x)); (x)=NULL; }
+
+#ifdef __SIPC_DBG__
+#define dbg_printf(...) printf(__VA_ARGS__)
+#else
+#define dbg_printf(...)
+#endif
 
 #define IPC_URL_MAX_LEN                     256
 #define IPC_CALLBACK_MAX_SUBSCRIPTIONS      20
@@ -81,12 +95,22 @@ struct _IpcHandle_t
     int                 repSock;
     int                 reqSock;
     cbPub_t             cbPub;
-    cbSub_t             cbSub[10];
+    cbSub_t             cbSub[IPC_CALLBACK_MAX_SUBSCRIPTIONS];
     char*               self;
 };
 
+typedef enum {IPC_Q_MSG_TYPE_MSG, IPC_Q_MSG_TYPE_CB} IpcQueueMsgType_t;
+
+typedef struct _IpcQueueMsg_t
+{
+	IpcQueueMsgType_t type;
+    IpcHandle_t       *ipcHdl;
+	void              *msg;
+    int               len;
+}IpcQueueMsg_t;
+
 typedef enum _IpcModuleUrlType_t{
-    IpcModuleUrl_Cb,
+     IpcModuleUrl_Cb,
     IpcModuleUrl_Ipc
 }IpcModuleUrlType_t;
 
@@ -96,7 +120,11 @@ typedef struct _nnStats
     char *statName;
 }nnStats_t;
 
+GAsyncQueue *ipcMsgRecvQ;
+
 extern int errno;
+
+IpcHandle_t *g_IpcHdl = NULL;
 
 /*---------------- FUNCTIONS ----------------*/
 
@@ -188,7 +216,7 @@ static int CbSub_GetFreeCbSlot(IpcHandle_t *ipcHdl, char *moduleName)
 {
     int i = CBSub_GetModuleIndex(ipcHdl, moduleName);
     if(i < 0) {
-        printf("%s: Module %s not registered", __func__, moduleName);
+        dbg_printf("%s: Module %s not registered", __func__, moduleName);
         return -1;
     }
 
@@ -212,13 +240,13 @@ static int CBSub_RequestNotification(IpcHandle_t *ipcHdl, char *moduleName, char
             j = CbSub_GetFreeCbSlot(ipcHdl, moduleName);
             if(j >= 0) {
                 ipcHdl->cbSub[i].cbFuncs[j] = strdup(cbName);
-                printf("%s: CB func %s registered", __func__, cbName);
+                dbg_printf("%s: CB func %s registered [index = %d]", __func__, cbName, i);
             }
             else
                 return -1;
         }
         else
-            printf("%s: CB func %s already registered", __func__, cbName);
+            dbg_printf("%s: CB func %s already registered", __func__, cbName);
     }
     
     return 0;
@@ -245,7 +273,7 @@ static int CBSub_AddModule(IpcHandle_t *ipcHdl, char *moduleName)
     }
     
     ipcHdl->cbSub[i].moduleName = strdup(moduleName);
-    printf("%s: CB for module %s registered", __func__, moduleName);
+    dbg_printf("%s: CB for module %s registered", __func__, moduleName);
 
     return 0;
 }
@@ -356,7 +384,7 @@ static int processCallbackNtf(IpcHandle_t *ipcHdl, char *buf, int bytes)
             }
         }
         else {
-            printf("%s:Invalid msgTypeData...[0x%x]\n", __func__, (int)msgTypeData);
+            printf("%s:Invalid msgTypeData...[%s]\n", __func__, msgTypeData);
             retval = -1;
         }
     }
@@ -415,7 +443,7 @@ static int processMsg(IpcHandle_t *ipcHdl, char *buf, int bytes)
             }
         }
         else {
-            printf("%s:Invalid msgTypeData...[0x%x]\n", __func__, (int)msgTypeData);
+            printf("%s:Invalid msgTypeData...[%s]\n", __func__, msgTypeData);
             retval = -1;
         }
     }
@@ -433,31 +461,36 @@ static int processMsg(IpcHandle_t *ipcHdl, char *buf, int bytes)
     return retval;
 }
 
-static void* ipcMessageRecv(void *arg)
+static void* ipcRecvMessagesThread(void *arg)
 {
-    int rv;
+	int rv;
     struct nn_pollfd pfd[MAX_POLL_FDS];
-    int i = 0, j = 0;
-
-    IpcHandle_t *ipcHdl = (IpcHandle_t *)arg;
     
-    for(i = 0; (ipcHdl->cbSub[i].subSock != SOCK_UNUSED) && (i < MAX_POLL_FDS); i++) 
-    {
-        pfd [i].fd     = ipcHdl->cbSub[i].subSock;       // poll for incoming callback notifications
-        pfd [i].events = NN_POLLIN;
-    }
-
-    pfd [i].fd = ipcHdl->repSock;               // poll for incoming requests
-    pfd [i].events = NN_POLLIN;
-
     for (;;) 
     {
-        rv = nn_poll (pfd, (i+1), -1);
+        int i = 0, j = 0, k = 0;
 
-        // printf("%s: Data available for reading...\n", __func__);
+        //IpcHandle_t *ipcHdl = (IpcHandle_t *)arg;
     
+        for(i = 0; i < IPC_CALLBACK_MAX_SUBSCRIPTIONS; i++) 
+        {
+            if(g_IpcHdl->cbSub[i].subSock != SOCK_UNUSED)
+            {
+                pfd [k].fd       = g_IpcHdl->cbSub[i].subSock;       // poll for incoming callback notifications
+                pfd [k++].events = NN_POLLIN;
+                dbg_printf("%s: Num subscriber sockets = %d g_IpcHdl->cbSub[i].subSock = %d \n", __func__, k, g_IpcHdl->cbSub[i].subSock);
+            }
+        }
+
+        pfd [k].fd = g_IpcHdl->repSock;               // poll for incoming requests
+        pfd [k].events = NN_POLLIN;
+
+        dbg_printf("%s: Num reply sockets = %d\n", __func__, k);
+
+        rv = nn_poll (pfd, (k+1), /*-1*/1000);
+
         if (rv == 0) {
-            printf ("%s:nn_poll Timeout!\n", __func__);
+            //printf ("%s:nn_poll Timeout!\n", __func__);
             continue;
         }
 
@@ -465,47 +498,122 @@ static void* ipcMessageRecv(void *arg)
             printf ("%s: Error nn_poll!\n", __func__);
             continue;
         }
+        
+        dbg_printf("%s: Data available for reading...\n", __func__);
 
-        for(j=0; j < i; j++) 
+        for(j=0; j < k; j++) 
         {
             if (pfd [j].revents & NN_POLLIN) 
             {
-                //printf ("reading from subSock %d...\n", j);
-                
+                dbg_printf("reading from subSock %d...\n", j);
                 char *buf = NULL;
                 int bytes;
 
-                if ((bytes = nn_recv(ipcHdl->cbSub[j].subSock, &buf, NN_MSG, 0)) < 0) {
+                if ((bytes = nn_recv(g_IpcHdl->cbSub[j].subSock, &buf, NN_MSG, 0)) < 0) {
                     printf("Error nn_recv from subSock\n ");
                     continue;
                 }
                 
-                printf("%s[%d]: RECEIVED CB[%s][bytes=%d]\n", __func__, getpid(), buf, bytes);
-                processCallbackNtf(ipcHdl, buf, bytes);
-                
-                nn_freemsg(buf);
+                dbg_printf("%s[%d]: RECEIVED CB[%s][bytes=%d]\n", __func__, getpid(), buf, bytes);
+                IpcQueueMsg_t *pmsg = calloc(1, sizeof(IpcQueueMsg_t));
+                if(pmsg)
+                {
+                    pmsg->type = IPC_Q_MSG_TYPE_CB;
+                    pmsg->ipcHdl = g_IpcHdl;
+                    pmsg->msg  = (void *)buf;
+                    pmsg->len  = bytes;
+
+                    g_async_queue_push(ipcMsgRecvQ, pmsg);
+                }
+                else
+                {
+                    printf("Error in calloc for pmsg, dropping msg... \n ");
+                    continue;
+                }
             }
+            else
+                printf("%s: NN_POLLIN not set in %d [%d]\n", __func__, j, g_IpcHdl->cbSub[j].subSock);
         }
 
-        if (pfd [i].revents & NN_POLLIN)
-        {            
+        if (pfd[j].revents & NN_POLLIN)
+        {
             //printf ("reading from repSock...\n");
             
             char *buf = NULL;
             int bytes;
 
-            if ((bytes = nn_recv(ipcHdl->repSock, &buf, NN_MSG, 0)) < 0) {
+            if ((bytes = nn_recv(g_IpcHdl->repSock, &buf, NN_MSG, 0)) < 0) {
                 printf("Error nn_recv from reqSock\n ");
                 continue;
             }
 
-            printf("%s[%d]: RECEIVED REQUEST[%s][bytes=%d]\n", __func__, getpid(), buf, bytes);
-            processMsg(ipcHdl, buf, bytes);
+            dbg_printf("%s[%d]: RECEIVED REQUEST[%s][bytes=%d]\n", __func__, getpid(), buf, bytes);
+            IpcQueueMsg_t *pmsg = calloc(1, sizeof(IpcQueueMsg_t));
+            if(pmsg)
+            {
+                pmsg->type = IPC_Q_MSG_TYPE_MSG;
+                pmsg->ipcHdl = g_IpcHdl;
+                pmsg->msg  = (void *)buf;
+                pmsg->len  = bytes;
 
-            nn_freemsg(buf);
+                g_async_queue_push(ipcMsgRecvQ, pmsg);
+            }
+            else
+            {
+                printf("Error in calloc for pmsg, dropping msg... \n ");
+            }
         }
     }
 
+    return 0;
+}
+
+static void* ipcProcessMessagesThread(void *arg)
+{
+    IpcQueueMsg_t *msg = NULL;
+
+    while(1)
+    {
+        msg = (IpcQueueMsg_t *)g_async_queue_pop(ipcMsgRecvQ);
+
+        if(msg && msg->msg && msg->len /*&& msg->ipcHdl*/)
+        {
+            switch(msg->type)
+            {
+
+                case IPC_Q_MSG_TYPE_CB:
+                {     
+                    dbg_printf("%s[%d]: RECEIVED CB[%s][bytes=%d]\n", __func__, getpid(), (char *)msg->msg, msg->len);
+                    processCallbackNtf(/*msg->ipcHdl*/g_IpcHdl, msg->msg, msg->len);
+                    
+                    nn_freemsg(msg->msg);
+                    break;
+                }
+                case IPC_Q_MSG_TYPE_MSG:
+                {
+                    dbg_printf("%s[%d]: RECEIVED REQUEST[%s][bytes=%d]\n", __func__, getpid(), (char *)msg->msg, msg->len);
+                    processMsg(/*msg->ipcHdl*/g_IpcHdl, msg->msg, msg->len);
+
+                    nn_freemsg(msg->msg);
+                    break;
+                }
+                default:
+                {
+                    printf("%s[%d]: Unknown msg type RECEIVED [%s][bytes=%d]\n", __func__, getpid(), (char *)msg->msg, msg->len);
+                    nn_freemsg(msg->msg);
+                    break;
+                }
+            }
+        }
+        else
+        {
+            if(msg)
+                printf("%s: incorrect msg to process: [%s] [len=%d]", __func__, (char *)msg->msg, msg->len);
+            else
+                printf("%s: empty msg", __func__);
+        }
+    }
+    
     return 0;
 }
 
@@ -540,7 +648,7 @@ int Ipc_MessageSend(IpcHandle_t *ipcHdl, char *moduleName, char *msg, int msglen
     
     FREE_MEM(url);
     
-    printf("%s[%d]: SENDING %s\n", __func__, getpid(), msg);
+    dbg_printf("%s[%d]: SENDING %s\n", __func__, getpid(), msg);
 
     char *msgBuf = NULL;
 
@@ -579,7 +687,7 @@ int Ipc_CallBackNotify(IpcHandle_t *ipcHdl, char *cbFunc, char *msg, int msglen)
             rv = -1;
         }
         else
-            printf("%s: PUBLISHING %s\n", __func__, msg);
+            dbg_printf("%s: PUBLISHING %s\n", __func__, msg);
     }
     else {
         rv = -1;
@@ -612,12 +720,14 @@ int IpcCallBackRegister(IpcHandle_t *ipcHdl, char *moduleName, char *cbName)
 
         CBSub_AddModule(ipcHdl, moduleName);
 
-        printf("%s: SUBSCRIBING to %s %s\n", __func__, moduleName, cbName);
+        dbg_printf("%s: SUBSCRIBING to %s %s\n", __func__, moduleName, cbName);
 
         if ((ipcHdl->cbSub[i].subSock = nn_socket(AF_SP, NN_SUB)) < 0) {
             printf("%s: Creating SUB socket failed!\n", __func__);
             return -1;
         }
+
+        dbg_printf("%s: Created SUB socket i=%d subsock=%d\n", __func__, i, ipcHdl->cbSub[i].subSock);
 
         // subscribe to everything ("" means all topics)
         if (nn_setsockopt(ipcHdl->cbSub[i].subSock, NN_SUB, NN_SUB_SUBSCRIBE, "", 0) < 0) {
@@ -665,8 +775,15 @@ int IpcInit(IpcHandle_t **pIpcHdl, IpcMsgClientHandler func, char *moduleName)
     *pIpcHdl = calloc(1, sizeof(IpcHandle_t));
     
     IpcHandle_t *ipcHdl = *pIpcHdl;
+    g_IpcHdl = ipcHdl;
     if(ipcHdl == NULL){
         printf("%s:failed to allocate memory for IpcHandle_t\n", __func__);
+        return -1;
+    }
+    
+    ipcMsgRecvQ = g_async_queue_new();
+    if(ipcMsgRecvQ == NULL){
+        printf("%s:failed to create ipcHdl->ipcMsgRecvQ\n", __func__);
         return -1;
     }
 
@@ -715,8 +832,15 @@ int IpcInit(IpcHandle_t **pIpcHdl, IpcMsgClientHandler func, char *moduleName)
         return -1;
     }
 
-    if ( pthread_create(&(ipcHdl->tId),  NULL, (void*(*)(void*))ipcMessageRecv, (void *)ipcHdl) < 0 ) {
-        printf("%s:Create thread fail!\n", __func__); 
+    if ( pthread_create(&(ipcHdl->tId),  NULL, (void*(*)(void*))ipcRecvMessagesThread, (void *)ipcHdl) < 0 ) {
+        printf("%s:Create ipcRecvMessagesThread fail!\n", __func__); 
+        FREE_MEM(cburl);
+        FREE_MEM(ipcurl);
+        return -1;
+    }
+    
+    if ( pthread_create(&(ipcHdl->tId),  NULL, (void*(*)(void*))ipcProcessMessagesThread, (void *)ipcHdl) < 0 ) {
+        printf("%s:Create ipcProcessMessagesThread fail!\n", __func__); 
         FREE_MEM(cburl);
         FREE_MEM(ipcurl);
         return -1;
